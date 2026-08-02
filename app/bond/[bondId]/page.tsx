@@ -12,7 +12,7 @@ import { useRouter, useParams } from 'next/navigation';
 import { useEffect, useRef, useState } from 'react';
 import { AlertTriangle, ArrowDownToLine, ArrowUp, Bell, Check, Copy, MessageCircle, Send, X } from 'lucide-react';
 import { AliveCta } from '@/app/components/agent/AliveCta';
-import { formatUsdc, shortAddress } from '@/lib/vault/usdc';
+import { formatUsdc, formatMoney, shortAddress } from '@/lib/vault/usdc';
 import { VAULT_ADDRESSES, VAULT_RULES } from '@/lib/contracts/vault';
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { useAgentStore, type Heir } from '@/lib/agent/agentStore';
@@ -26,6 +26,14 @@ import { useBondVault } from '@/lib/hooks/useBondVault';
 import { useVaultActions } from '@/lib/hooks/useVaultActions';
 import { useVaultTransfers } from '@/lib/hooks/useVaultTransfers';
 import { SendFundsForm } from '@/app/components/vault/SendFundsForm';
+import { DissolveBond } from '@/app/components/bond/DissolveBond';
+import { useDissolution } from '@/lib/hooks/useDissolution';
+import { useAgentHydrated } from '@/lib/agent/useAgentHydrated';
+import { PendingMoney } from '@/app/components/bond/PendingMoney';
+import { useVaultSpends } from '@/lib/hooks/useVaultSpends';
+import { useMockVaultStore } from '@/lib/mocks/vaultStore';
+import { StageLoading } from '@/app/components/StageLoading';
+import { BondDissolutionOverlay } from '@/app/components/marriage/BondDissolutionOverlay';
 
 // --- tiny self-contained chat for the trustee room ------------------------
 
@@ -73,6 +81,7 @@ export default function BondProfilePage() {
   const [sendOpen, setSendOpen] = useState(false);
   const {
     state: spendState, error: spendError, txError: spendTxError, proposeSpend, reset: resetSpend,
+    approveSpend, cancelSpend,
   } = useVaultActions({
     bondId: lBondId,
     partnerA: lPartnerA,
@@ -99,6 +108,7 @@ export default function BondProfilePage() {
     });
     return proposeSpend(to, amount, willExecuteImmediately);
   };
+  const agentHydrated = useAgentHydrated();
   const params = useParams<{ bondId: string }>();
   const {
     agentReady, answers, payments, heirs, addHeir, requestRemoveHeir,
@@ -133,6 +143,14 @@ export default function BondProfilePage() {
     refetch: refetchTransfers,
   } = useVaultTransfers(liveVault?.address ?? null);
   const [shownTransfers, setShownTransfers] = useState(5);
+  // Pending money: manual sends waiting for a signature (module/sim) plus the
+  // agent proposals waiting for a human release. Both belong on this account.
+  const { spends, refetch: refetchSpends } = useVaultSpends(lBondId, lPartnerA, lPartnerB);
+  const mockActingAs = useMockVaultStore((s) => s.actingAs);
+  const viewer = USE_MOCKS ? mockActingAs : myWallet;
+  const agentProposals = Object.values(payments).filter(
+    (p) => p.stage === 'proposed' && !p.personal && (p.bondId ?? bond.id) === bond.id,
+  );
   const copyToClipboard = async (text: string, field: 'ens' | 'addr') => {
     await navigator.clipboard.writeText(text);
     setCopiedField(field);
@@ -148,6 +166,16 @@ export default function BondProfilePage() {
   const [heirShare, setHeirShare] = useState(100);
   const [confirmRemove, setConfirmRemove] = useState<Heir | null>(null);
   const [ruleDraft, setRuleDraft] = useState('');
+  // The closing ceremony. It must be claimed BEFORE the write lands: executing
+  // flips the bond to 'dissolved', and the guard below would otherwise redirect
+  // out from under the overlay — the goodbye would never play.
+  const [ceremony, setCeremony] = useState<'off' | 'confirming' | 'done'>('off');
+  // Ending the bond: chain in live, agent store in mock — one shape either way.
+  const {
+    dissolution, delayMs: dissolutionDelayMs, state: dissolutionTxState,
+    error: dissolutionError, request: requestDissolution,
+    cancel: cancelDissolution, execute: executeDissolution,
+  } = useDissolution(bond.id);
   const endRef = useRef<HTMLDivElement>(null);
   const greeted = useRef(false);
   const rogueShown = useRef(false);
@@ -160,9 +188,19 @@ export default function BondProfilePage() {
   // Live routing belongs to the contract (lib/hooks/useLiveStage.ts) — /bond/*
   // lives on the dashboard surface. Mock keeps its local agent gate.
   useRouteGuard('/bond');
+  // Both gates below read PERSISTED state (agentReady, bond.status). Acting on
+  // it before rehydration is what made every deep link to a bond land on /home.
   useEffect(() => {
+    if (!agentHydrated) return;
     if (USE_MOCKS && !agentReady) router.replace('/home');
-  }, [agentReady, router]);
+  }, [agentHydrated, agentReady, router]);
+
+  // A dissolved bond has no dashboard. The ceremony owns the exit when it is
+  // running; this only catches a direct visit (deep link, back button).
+  useEffect(() => {
+    if (!agentHydrated) return;
+    if (bond.status === 'dissolved' && ceremony === 'off') router.replace('/profile');
+  }, [agentHydrated, bond.status, ceremony, router]);
 
   // PROACTIVE: the trustee consulted both agents overnight — the humans get
   // an opportunity, not a question. Intro line, then the push-style card.
@@ -215,7 +253,7 @@ export default function BondProfilePage() {
     endRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   }, [msgs, yieldState, liveAction, busy]);
 
-  if (!agentReady) return null;
+  if (!agentHydrated || !agentReady) return <StageLoading />;
 
   const threshold = answers.threshold?.id === 't50' ? '€50' : answers.threshold?.id === 'unusual' ? 'unusual only' : '€200';
 
@@ -555,14 +593,14 @@ export default function BondProfilePage() {
         <section className="bg-[#1A1A1A] rounded-[2rem] p-6 relative overflow-hidden">
           <p className={`${META} relative z-10`}>Parked in the vault</p>
           <p className="text-4xl font-anton text-white tracking-wide mt-1 relative z-10">
-            {Math.round(balance).toLocaleString('en-US')}
+            {formatMoney(balance)}
             <span className="text-gray-500 ml-2">USDC</span>
           </p>
           {/* Where the money lives — simple and unmissable */}
           <div className="mt-3 flex gap-2 relative z-10">
             <div className="flex-1 bg-white/5 rounded-xl px-4 py-2.5">
               <p className={META}>Ready to spend</p>
-              <p className="text-lg font-anton text-white tracking-wide">{Math.round(liquid).toLocaleString('en-US')}</p>
+              <p className="text-lg font-anton text-white tracking-wide">{formatMoney(liquid)}</p>
             </div>
             <div className="flex-1 bg-emerald-500/10 rounded-xl px-4 py-2.5">
               <p className="font-anton text-[11px] text-emerald-400/80 uppercase tracking-wide flex items-center gap-1">
@@ -570,7 +608,7 @@ export default function BondProfilePage() {
                 Earning
               </p>
               <p className="text-lg font-anton text-emerald-300 tracking-wide">
-                {Math.round(invested?.amount ?? 0).toLocaleString('en-US')}
+                {formatMoney(invested?.amount ?? 0)}
               </p>
             </div>
           </div>
@@ -660,6 +698,16 @@ export default function BondProfilePage() {
             onReset={resetSpend}
           />
         )}
+
+        <PendingMoney
+          spends={spends}
+          proposals={agentProposals}
+          viewer={viewer}
+          partnerName={bond.partner}
+          txState={spendState}
+          onApprove={async (id) => { await approveSpend(id); void refetchSpends(); }}
+          onCancel={async (id) => { await cancelSpend(id); void refetchSpends(); }}
+        />
 
         {/* Trustee room */}
         <section className="space-y-3">
@@ -797,6 +845,26 @@ export default function BondProfilePage() {
               ))
             )}
           </div>
+        </section>
+
+        {/* Memory — the bond's soulbound certificates. Tap the card, no chevron. */}
+        <section className="space-y-3">
+          <div>
+            <h2 className="text-2xl font-anton text-black tracking-wide">MEMORY</h2>
+            <p className={`${META} mt-0.5`}>What the chain keeps of you two</p>
+          </div>
+          <button
+            onClick={() => router.push(`/marriage/gallery?bond=${bond.id}`)}
+            className="w-full bg-white rounded-2xl px-5 py-4 text-left transition-all hover:shadow-md active:scale-[0.99]"
+          >
+            <div className="flex items-center justify-between gap-4">
+              <div>
+                <p className="font-anton text-lg text-black tracking-wide">CERTIFICATE &amp; ANNIVERSARIES</p>
+                <p className={`${META} mt-0.5`}>Soulbound — they outlive the bond itself</p>
+              </div>
+              <p className={`${META} shrink-0`}>Open</p>
+            </div>
+          </button>
         </section>
 
         {/* Rules — settings, at the bottom where settings belong */}
@@ -977,6 +1045,26 @@ export default function BondProfilePage() {
             </div>
           </section>
         )}
+
+        {/* The exit, last on the page — reachable, never inviting. */}
+        <DissolveBond
+          partner={bond.partner}
+          balance={balance}
+          dissolution={dissolution}
+          delayMs={dissolutionDelayMs}
+          busy={dissolutionTxState === 'sending'}
+          error={dissolutionError}
+          onRequest={requestDissolution}
+          onCancel={cancelDissolution}
+          onExecute={async () => {
+            // 'confirming' first: it both claims the ceremony ahead of the store
+            // flip and gives the overlay its waiting phase while the tx is mined.
+            setCeremony('confirming');
+            const ok = await executeDissolution();
+            setCeremony(ok ? 'done' : 'off');
+            return ok;
+          }}
+        />
       </main>
 
       {/* Floating hand-off to YOUR OWN agent — Claude-app-style pill, only while
@@ -990,6 +1078,16 @@ export default function BondProfilePage() {
           <MessageCircle size={14} />
           <span className="text-[11px] font-bold">Your agent</span>
         </button>
+      )}
+
+      {/* Spinner while the write settles, then the goodbye, then home — where an
+          unbonded human belongs (useLiveStage sends them there anyway). */}
+      {ceremony !== 'off' && (
+        <BondDissolutionOverlay
+          isReady={ceremony === 'done'}
+          partnerName={bond.partner}
+          onComplete={() => router.replace('/home')}
+        />
       )}
 
       {/* ACHTUNG: removing someone from the will is a two-person decision */}

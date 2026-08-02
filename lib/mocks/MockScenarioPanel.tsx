@@ -16,7 +16,8 @@ import { useMockStore } from "./mockStore";
 import { SCENARIOS, type Scenario } from "./scenarios";
 import { useMockVaultStore, MOCK_VAULT } from "./vaultStore";
 import { formatUsdc, shortAddress } from "@/lib/vault/usdc";
-import { useAgentStore } from "@/lib/agent/agentStore";
+import { useAgentStore, DISSOLUTION_DELAY_MS } from "@/lib/agent/agentStore";
+import { useNow } from "@/lib/hooks/useNow";
 
 export function MockScenarioPanel() {
   const router = useRouter();
@@ -24,9 +25,83 @@ export function MockScenarioPanel() {
   const setScenario = useMockStore((s) => s.setScenario);
   const queryClient = useQueryClient();
   const [open, setOpen] = useState(true);
-  const [tab, setTab] = useState<"bond" | "vault">("bond");
+  const [tab, setTab] = useState<"bond" | "vault" | "agent" | "end">("bond");
 
   const vault = useMockVaultStore();
+
+  // --- dissolution playground ------------------------------------------------
+  // Every state of the exit is one tap away: requested by either partner, mid
+  // wait, past the 3 days, and dissolved. Nobody waits 72h to see a screen.
+  const bonds = useAgentStore((s) => s.bonds);
+  const dissolutions = useAgentStore((s) => s.dissolutions);
+  const [endBondId, setEndBondId] = useState("alice");
+  const endBond = bonds.find((b) => b.id === endBondId) ?? bonds[0];
+  const endDissolution = endBond ? dissolutions[endBond.id] : undefined;
+  // The panel has to know whether the delay elapsed, and that answer changes
+  // with the clock — so it ticks instead of reading Date.now() during render.
+  const now = useNow(Boolean(endDissolution));
+  const endReady = Boolean(endDissolution) && now - endDissolution!.requestedAt >= DISSOLUTION_DELAY_MS;
+
+  // --- personal agent -------------------------------------------------------
+  // Deliberately NOT a marriage scenario: `agentReady` is local/0G state, not a
+  // chain read, and it is orthogonal to whether you are bonded. Folding it into
+  // the scenario snapshots would mean 5 scenarios x 2 agent states and a second
+  // source of truth for the same flag — the trap `dissolutionPending` was.
+  const agentReady = useAgentStore((s) => s.agentReady);
+  const answers = useAgentStore((s) => s.answers);
+  const importedSources = useAgentStore((s) => s.importedSources);
+  const answeredCount = Object.keys(answers).length;
+
+  /** Back to "bonded, but the agent was never trained" — the gate before the bond. */
+  const untrainAgent = () => {
+    useAgentStore.setState({
+      agentReady: false,
+      bornPending: false,
+      step: 0,
+      answers: {},
+      askedIds: [],
+      importedSources: [],
+      messages: [],
+    });
+    router.push("/home");
+  };
+
+  /** Skip the interview — the agent exists and the bond opens. */
+  const trainAgent = () => {
+    useAgentStore.setState({ agentReady: true, bornPending: false });
+  };
+
+  /** Back-date the open request so the delay has elapsed → the finalize state. */
+  const skipDelay = () => {
+    if (!endBond) return;
+    const open = useAgentStore.getState().dissolutions[endBond.id];
+    if (!open) return;
+    useAgentStore.setState((s) => ({
+      dissolutions: {
+        ...s.dissolutions,
+        [endBond.id]: { ...open, requestedAt: Date.now() - DISSOLUTION_DELAY_MS - 1000 },
+      },
+    }));
+  };
+
+  /** Put the bond back on its feet — clears the request and the dissolved flag.
+   *  Also rewinds the marriage scenario: executing left it on 'cooldown', and a
+   *  restored bond next to an unbonded dashboard is a state that cannot exist. */
+  const restoreBond = () => {
+    if (!endBond) return;
+    useAgentStore.setState((s) => {
+      const next = { ...s.dissolutions };
+      delete next[endBond.id];
+      return {
+        dissolutions: next,
+        bonds: s.bonds.map((b) => (b.id === endBond.id ? { ...b, status: "active" as const } : b)),
+      };
+    });
+    // The vault sim is the source the dashboard mirrors — refill THAT, not the
+    // mirrored copy, or the balance would snap back to 0 on the next tick.
+    vault.reset();
+    select("married");
+  };
 
   const select = (id: Scenario) => {
     setScenario(id);
@@ -39,7 +114,7 @@ export function MockScenarioPanel() {
 
   const openAsApprover = (spendId: `0x${string}`) => {
     // The notification lands on the *other* partner. Switch identity first so
-    // the pending page shows Approve / Decline instead of "waiting".
+    // the list shows Approve / Decline instead of "waiting".
     const spend = vault.spends.find((s) => s.spendId === spendId);
     if (spend) {
       const approver =
@@ -48,8 +123,9 @@ export function MockScenarioPanel() {
           : MOCK_VAULT.SELF;
       vault.setActingAs(approver);
     }
-    setTab("vault");
-    router.push(`/vault/pending/${spendId}`);
+    // The bond dashboard is where pending money lives now — not the legacy
+    // /vault screen, which nothing in the current flow links to.
+    router.push(`/bond/${useAgentStore.getState().defaultBondId}`);
   };
 
   return (
@@ -85,6 +161,22 @@ export function MockScenarioPanel() {
               }`}
             >
               Vault{pendingSpends.length > 0 ? ` (${pendingSpends.length})` : ""}
+            </button>
+            <button
+              onClick={() => setTab("agent")}
+              className={`flex-1 text-[10px] font-bold uppercase tracking-widest py-2 transition-colors ${
+                tab === "agent" ? "bg-white/10 text-white" : "text-white/40 hover:text-white/70"
+              }`}
+            >
+              Agent
+            </button>
+            <button
+              onClick={() => setTab("end")}
+              className={`flex-1 text-[10px] font-bold uppercase tracking-widest py-2 transition-colors ${
+                tab === "end" ? "bg-white/10 text-white" : "text-white/40 hover:text-white/70"
+              }`}
+            >
+              End
             </button>
           </div>
 
@@ -124,7 +216,7 @@ export function MockScenarioPanel() {
                   → Open bond dashboard (full demo state)
                 </button>
               </div>
-            ) : (
+            ) : tab === "vault" ? (
               <div className="p-2 flex flex-col gap-2">
                 <div className="px-1 py-1 space-y-0.5">
                   <p className="text-[9px] uppercase tracking-widest text-white/40">Balance</p>
@@ -228,6 +320,167 @@ export function MockScenarioPanel() {
                     Reset vault
                   </button>
                 </div>
+              </div>
+            ) : tab === "agent" ? (
+              <div className="p-2 flex flex-col gap-2">
+                <div className="px-1 py-1 space-y-0.5">
+                  <p className="text-[9px] uppercase tracking-widest text-white/40">State</p>
+                  <p className="text-[11px] font-bold text-white">
+                    {agentReady
+                      ? "Trained · the bond opens"
+                      : answeredCount > 0 || importedSources.length > 0
+                        ? `Interview in progress · ${answeredCount}/7 answered`
+                        : "Not trained · bond is gated"}
+                  </p>
+                </div>
+
+                <div className="flex flex-col gap-1 pt-1 border-t border-white/10">
+                  {agentReady ? (
+                    <button
+                      onClick={untrainAgent}
+                      className="text-left text-[11px] font-bold px-3 py-2 rounded-lg bg-white/5 text-white/70 hover:bg-white/10 transition-colors"
+                    >
+                      Untrain → back to the gate
+                    </button>
+                  ) : (
+                    <>
+                      <button
+                        onClick={() => router.push("/agent/create")}
+                        className="text-left text-[11px] font-bold px-3 py-2 rounded-lg bg-amber-500/15 text-amber-300 hover:bg-amber-500/25 transition-colors"
+                      >
+                        → Play the interview
+                      </button>
+                      <button
+                        onClick={trainAgent}
+                        className="text-left text-[11px] font-bold px-3 py-2 rounded-lg bg-white/5 text-white/70 hover:bg-white/10 transition-colors"
+                      >
+                        Skip it — mark as trained
+                      </button>
+                    </>
+                  )}
+                  <button
+                    onClick={() => router.push("/agent")}
+                    className="text-left text-[11px] font-bold px-3 py-2 rounded-lg bg-white/5 text-white/70 hover:bg-white/10 transition-colors"
+                  >
+                    → Open the agent chat
+                  </button>
+                  {agentReady && (
+                    <button
+                      onClick={() => {
+                        // The agents negotiate a shared spend and hand it to the
+                        // humans — it must surface on the bond, not only in chat.
+                        const s = useAgentStore.getState();
+                        const b = s.bonds.find((x) => x.id === s.defaultBondId);
+                        s.proposeShared(
+                          "Anniversary dinner",
+                          "restaurant.eth",
+                          120,
+                          "Both calendars were free — table for two, Saturday",
+                          b ? { id: b.id, partner: b.partner } : undefined,
+                        );
+                        router.push(`/bond/${s.defaultBondId}`);
+                      }}
+                      className="text-left text-[11px] font-bold px-3 py-2 rounded-lg bg-amber-500/15 text-amber-300 hover:bg-amber-500/25 transition-colors"
+                    >
+                      → Agent proposes a shared spend
+                    </button>
+                  )}
+                </div>
+
+                <p className="text-[9px] text-white/30 px-1 leading-relaxed">
+                  Untrained + bonded is the gate: /home offers &quot;Create your agent&quot; and
+                  /bond/* sends you back. This is NOT a marriage scenario — the agent axis is
+                  independent of whether you are bonded.
+                </p>
+              </div>
+            ) : (
+              <div className="p-2 flex flex-col gap-2">
+                {/* Which bond we are ending — the inheritance one by default. */}
+                <div className="space-y-1">
+                  <p className="text-[9px] uppercase tracking-widest text-white/40 px-1">Bond</p>
+                  <div className="flex gap-1">
+                    {bonds.map((b) => (
+                      <button
+                        key={b.id}
+                        onClick={() => setEndBondId(b.id)}
+                        className={`flex-1 text-[10px] font-bold px-2 py-2 rounded-lg transition-colors ${
+                          endBond?.id === b.id
+                            ? "bg-amber-500 text-black"
+                            : "bg-white/5 text-white/70 hover:bg-white/10"
+                        }`}
+                      >
+                        {b.partner}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="px-1 py-1 space-y-0.5 border-t border-white/10 pt-2">
+                  <p className="text-[9px] uppercase tracking-widest text-white/40">State</p>
+                  <p className="text-[11px] font-bold text-white">
+                    {endBond?.status === "dissolved"
+                      ? "Dissolved"
+                      : !endDissolution
+                        ? "Active · no request"
+                        : endReady
+                          ? `Ready to finalize (${endDissolution.requester})`
+                          : `Pending · requested by ${endDissolution.requester}`}
+                  </p>
+                </div>
+
+                {!endDissolution && endBond?.status !== "dissolved" ? (
+                  <div className="flex flex-col gap-1 pt-1 border-t border-white/10">
+                    <button
+                      onClick={() => endBond && useAgentStore.getState().requestDissolution(endBond.id, "you")}
+                      className="text-left text-[11px] font-bold px-3 py-2 rounded-lg bg-white/5 text-white/70 hover:bg-white/10 transition-colors"
+                    >
+                      Request — as you
+                    </button>
+                    <button
+                      onClick={() => endBond && useAgentStore.getState().requestDissolution(endBond.id, "partner")}
+                      className="text-left text-[11px] font-bold px-3 py-2 rounded-lg bg-white/5 text-white/70 hover:bg-white/10 transition-colors"
+                    >
+                      Request — as {endBond?.partner} (no cancel for you)
+                    </button>
+                  </div>
+                ) : endDissolution ? (
+                  <div className="flex flex-col gap-1 pt-1 border-t border-white/10">
+                    <button
+                      onClick={skipDelay}
+                      className="text-left text-[11px] font-bold px-3 py-2 rounded-lg bg-white/5 text-white/70 hover:bg-white/10 transition-colors"
+                    >
+                      Skip the 3 days → finalize state
+                    </button>
+                    <button
+                      onClick={() => {
+                        if (!endBond) return;
+                        // Same two steps as useDissolution: settle the vault sim
+                        // FIRST, or the mirror puts the money back a tick later.
+                        vault.settle();
+                        useAgentStore.getState().executeDissolution(endBond.id);
+                      }}
+                      disabled={!endReady}
+                      className="text-left text-[11px] font-bold px-3 py-2 rounded-lg bg-red-500/20 text-red-300 hover:bg-red-500/30 disabled:opacity-30 disabled:hover:bg-red-500/20 transition-colors"
+                    >
+                      Execute now (splits the vault)
+                    </button>
+                  </div>
+                ) : null}
+
+                <div className="pt-1 border-t border-white/10">
+                  <button
+                    onClick={restoreBond}
+                    className="w-full text-left text-[11px] font-bold px-3 py-2 rounded-lg bg-white/5 text-white/70 hover:bg-white/10 transition-colors"
+                  >
+                    Reset bond to active
+                  </button>
+                </div>
+
+                <p className="text-[9px] text-white/30 px-1 leading-relaxed">
+                  The exit lives at the bottom of /bond/{endBond?.id ?? "alice"}. Requesting as{" "}
+                  {endBond?.partner ?? "the partner"} is the case with no cancel button — leaving is
+                  never gated.
+                </p>
               </div>
             )}
           </div>
